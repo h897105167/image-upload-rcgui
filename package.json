@@ -1,0 +1,17 @@
+{
+  "name": "image-upload-rcgui",
+  "version": "1.0.0",
+  "description": "Obsidian plugin that uploads images to the RCGUI imagehost plugin over HTTP.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "node esbuild.mjs --watch",
+    "build": "node esbuild.mjs --production",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "obsidian": "latest",
+    "typescript": "^5.7.3"
+  }
+}
