@@ -9,6 +9,7 @@ import {
 	TAbstractFile,
 	TFile,
 } from 'obsidian';
+import { embedMarkdown, Fit, fitForDisplay } from './embed';
 import { RcguiSettingTab } from './settings';
 import { DEFAULT_SETTINGS, RcguiSettings } from './types';
 import {
@@ -20,12 +21,26 @@ import {
 } from './uploader';
 
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp|avif|svg)$/i;
+/** Wiki embed: `![[a.png]]` or `![[a.png|300]]`. */
 const EMBED = /!\[\[([^\]|]+)(\|[^\]]*)?\]\]/;
+/** Markdown image: `![](a.png)`, `![alt](<a b.png>)`, `![alt](a.png "title")`. */
+const MD_IMAGE = /!\[([^\]]*)\]\((<[^>]+>|[^)\s]+)(\s+"[^"]*")?\)/g;
+/** Same as {@link EMBED}, global, for rewriting every occurrence on a line. */
+const EMBED_G = /!\[\[([^\]|]+)(\|[^\]]*)?\]\]/g;
+/** Which flavour of image reference a match came from. */
+type EmbedKind = 'wiki' | 'md';
 
 export default class ImageUploadRcgui extends Plugin {
 	settings: RcguiSettings = { ...DEFAULT_SETTINGS };
 	private statusEl: HTMLElement | null = null;
 	private busy = 0;
+	private ticker: number | null = null;
+	private startedAt = 0;
+	private said60 = false;
+	private said180 = false;
+	private said360 = false;
+	/** Uploads run one at a time: the site queues them anyway, and 3 parallel requests made one take 28 s. */
+	private chain: Promise<unknown> = Promise.resolve();
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -62,7 +77,9 @@ export default class ImageUploadRcgui extends Plugin {
 						item
 							.setTitle('上传图片')
 							.setIcon('upload')
-							.onClick(() => void this.uploadEmbed(target.file, target.match, editor, info)),
+							.onClick(() =>
+								void this.uploadEmbed(target.file, target.match, target.kind, editor, info),
+							),
 					);
 					return;
 				}
@@ -117,7 +134,7 @@ export default class ImageUploadRcgui extends Plugin {
 					new Notice('光标没落在一个图片内链上');
 					return;
 				}
-				await this.uploadEmbed(target.file, target.match, editor, view);
+				await this.uploadEmbed(target.file, target.match, target.kind, editor, view);
 			},
 		});
 
@@ -126,6 +143,7 @@ export default class ImageUploadRcgui extends Plugin {
 	}
 
 	onunload(): void {
+		this.stopTicker();
 		this.statusEl = null;
 	}
 
@@ -154,8 +172,8 @@ export default class ImageUploadRcgui extends Plugin {
 		let cursor = from;
 		for (const file of files) {
 			try {
-				const url = await this.send(file, stampName(file));
-				const snippet = `![](${url})`;
+				const sent = await this.send(file, stampName(file));
+				const snippet = embedMarkdown(sent.url, sent.fit);
 				editor.replaceRange(snippet, cursor);
 				cursor = editor.offsetToPos(editor.posToOffset(cursor) + snippet.length);
 			} catch (e) {
@@ -181,7 +199,7 @@ export default class ImageUploadRcgui extends Plugin {
 			const hit = this.embedNear(editor, info, from.line);
 			if (hit && hit.file.stat.mtime >= Date.now() - 15000) {
 				handled += 1;
-				await this.uploadEmbed(hit.file, hit.match, editor, info, hit.line);
+				await this.uploadEmbed(hit.file, hit.match, hit.kind, editor, info, hit.line);
 				continue;
 			}
 			await sleep(hit ? 80 : 150);
@@ -193,15 +211,13 @@ export default class ImageUploadRcgui extends Plugin {
 		editor: Editor,
 		info: MarkdownView | MarkdownFileInfo,
 		line: number,
-	): { file: TFile; match: RegExpMatchArray; line: number } | null {
+	): { file: TFile; match: RegExpMatchArray; kind: EmbedKind; line: number } | null {
 		const notePath = info.file?.path ?? '';
 		for (const at of [line, line + 1]) {
 			if (at < 0 || at >= editor.lineCount()) continue;
-			const match = editor.getLine(at).match(EMBED);
-			if (!match) continue;
-			const dest = this.app.metadataCache.getFirstLinkpathDest(match[1].trim(), notePath);
-			if (!dest) continue;
-			return { file: dest, match, line: at };
+			const hit = this.matchRef(editor.getLine(at), notePath);
+			if (!hit) continue;
+			return { ...hit, line: at };
 		}
 		return null;
 	}
@@ -209,26 +225,30 @@ export default class ImageUploadRcgui extends Plugin {
 	private async uploadEmbed(
 		file: TFile,
 		match: RegExpMatchArray,
+		kind: EmbedKind,
 		editor: Editor,
 		info: MarkdownView | MarkdownFileInfo,
 		line?: number,
 	): Promise<void> {
 		const notePath = info.file?.path ?? '';
-		const linkText = match[1].trim();
-		const dest = this.app.metadataCache.getFirstLinkpathDest(linkText, notePath);
-		const target = dest ?? file;
+		const target = this.resolveLinkpath(match[1], notePath) ?? file;
 		try {
 			const buf = await this.app.vault.readBinary(target);
 			const blob = new Blob([buf], { type: this.mimeOf(target) });
-			const url = await this.send(blob, target.name);
+			const sent = await this.send(blob, target.name);
+			const at = line ?? editor.getCursor().line;
 			if (this.settings.replaceEmbeds) {
-				const replacement = `![](${url})`;
-				const at = line ?? editor.getCursor().line;
 				const lineText = editor.getLine(at);
-				const next = lineText.replace(match[0], replacement);
-				if (next !== lineText) editor.setLine(at, next);
+				const next = lineText.replace(match[0], this.replacementFor(kind, match, sent.url, sent.fit));
+				if (next !== lineText) {
+					editor.setLine(at, next);
+				} else {
+					// Nothing was swapped: say why instead of silently leaving the old path behind.
+					new Notice(`已上传，但第 ${at + 1} 行没找到这段引用，链接已复制：${sent.url}`, 10000);
+					await navigator.clipboard.writeText(sent.url).catch(() => undefined);
+				}
 			} else {
-				new Notice(`已上传：${url}`, 8000);
+				new Notice(`已上传：${sent.url}`, 8000);
 			}
 			if (this.settings.deleteLocalFile) await this.trash(target);
 		} catch (e) {
@@ -237,54 +257,80 @@ export default class ImageUploadRcgui extends Plugin {
 	}
 
 	private async uploadSelection(editor: Editor, info: MarkdownView | MarkdownFileInfo): Promise<void> {
-		const text = editor.getSelection();
-		const match = text.match(EMBED) ?? editor.getLine(editor.getCursor().line).match(EMBED);
-		if (!match) {
+		const notePath = info.file?.path ?? '';
+		const text = editor.getSelection() || editor.getLine(editor.getCursor().line);
+		const hit = this.matchRef(text, notePath);
+		if (!hit) {
 			new Notice('没在选中内容里找到图片引用');
 			return;
 		}
-		const dest = this.app.metadataCache.getFirstLinkpathDest(
-			match[1].trim(),
-			info.file?.path ?? '',
-		);
-		if (!dest) {
-			new Notice(`找不到图片：${match[1]}`);
-			return;
-		}
-		await this.uploadEmbed(dest, match, editor, info);
+		await this.uploadEmbed(hit.file, hit.match, hit.kind, editor, info);
 	}
 
 	private async uploadVaultFile(file: TFile): Promise<void> {
 		try {
 			const buf = await this.app.vault.readBinary(file);
 			const blob = new Blob([buf], { type: this.mimeOf(file) });
-			const url = await this.send(blob, file.name);
-			await navigator.clipboard.writeText(url).catch(() => undefined);
-			new Notice(`已上传并复制链接：${url}`, 8000);
+			const sent = await this.send(blob, file.name);
+			await navigator.clipboard.writeText(sent.url).catch(() => undefined);
+			// A file picked in the explorer has no cursor, so rewrite every reference to it in the open note.
+			const swapped = this.settings.replaceEmbeds
+				? this.replaceReferencesInActiveNote(file, sent.url, sent.fit)
+				: 0;
+			new Notice(
+				swapped > 0
+					? `已上传，替换了当前笔记里 ${swapped} 处引用：${sent.url}`
+					: `已上传并复制链接（当前笔记里没有引用它）：${sent.url}`,
+				8000,
+			);
 			if (this.settings.deleteLocalFile) await this.trash(file);
 		} catch (e) {
 			this.fail(e);
 		}
 	}
 
-	/** One full upload: shrink -> upload -> the URL to insert. */
-	private async send(blob: Blob, name: string): Promise<string> {
+	/** Queue the upload behind whatever is still running, then hand it to `sendNow`. */
+	private send(blob: Blob, name: string): Promise<{ url: string; fit: Fit }> {
+		const run = () => this.sendNow(blob, name);
+		const next = this.chain.then(run, run);
+		this.chain = next.then(
+			() => undefined,
+			() => undefined,
+		);
+		return next;
+	}
+
+	/** One full upload: (optional) shrink -> upload -> URL + the display size for the note. */
+	private async sendNow(blob: Blob, name: string): Promise<{ url: string; fit: Fit }> {
 		this.begin();
 		try {
-			const prepared = await prepareImage(blob, name, this.settings.maxWidth, this.settings.maxHeight);
+			const prepared = await prepareImage(
+				blob,
+				name,
+				this.settings.maxWidth,
+				this.settings.maxHeight,
+				this.settings.shrinkPixels,
+			);
 			const res = await this.client().upload(prepared.blob, prepared.filename);
 			const shortOk = this.settings.linkKind === 'short' && !!res.short_url;
 			if (this.settings.linkKind === 'short' && !res.short_url && res.short_error) {
 				new Notice(`短链没成（${res.short_error}），先用直链`, 6000);
 			}
 			const url = shortOk ? (res.short_url as string) : res.url;
+			const fit = fitForDisplay(
+				prepared.width,
+				prepared.height,
+				this.settings.maxWidth,
+				this.settings.maxHeight,
+			);
 			this.renderStatus('就绪');
 			const bits: string[] = [];
 			if (res.compressed) bits.push(`压缩 ${fmtSize(res.original_size)} → ${fmtSize(res.size)}`);
 			if (res.deduped) bits.push('命中已有文件');
 			if (prepared.resized && !res.compressed) bits.push(`缩到 ${prepared.width}×${prepared.height}`);
+			if (fit.scaled) bits.push(`显示 ${fit.width}×${fit.height}`);
 			new Notice(`上传成功${bits.length ? `（${bits.join('，')}）` : ''}`, 4000);
-			return url;
+			return { url, fit };
 		} finally {
 			this.end();
 		}
@@ -305,13 +351,99 @@ export default class ImageUploadRcgui extends Plugin {
 	private embedAtCursor(
 		editor: Editor,
 		info: MarkdownView | MarkdownFileInfo,
-	): { file: TFile; match: RegExpMatchArray } | null {
-		const line = editor.getLine(editor.getCursor().line);
-		const match = line.match(EMBED);
-		if (!match) return null;
-		const dest = this.app.metadataCache.getFirstLinkpathDest(match[1].trim(), info.file?.path ?? '');
-		if (!dest) return null;
-		return { file: dest, match };
+	): { file: TFile; match: RegExpMatchArray; kind: EmbedKind } | null {
+		return this.matchRef(editor.getLine(editor.getCursor().line), info.file?.path ?? '');
+	}
+
+	/** First image reference in `text` that points at a real vault file (wiki embed or markdown image). */
+	private matchRef(
+		text: string,
+		notePath: string,
+	): { file: TFile; match: RegExpMatchArray; kind: EmbedKind } | null {
+		const wiki = text.match(EMBED);
+		if (wiki) {
+			const dest = this.resolveLinkpath(wiki[1], notePath);
+			if (dest) return { file: dest, match: wiki, kind: 'wiki' };
+		}
+		MD_IMAGE.lastIndex = 0;
+		const md = MD_IMAGE.exec(text);
+		if (md) {
+			const dest = this.resolveLinkpath(md[2], notePath);
+			if (dest) return { file: dest, match: md, kind: 'md' };
+		}
+		return null;
+	}
+
+	/**
+	 * Resolve a link target to a vault file, accepting both the wiki form (`a.png`,
+	 * `folder/a.png`) and markdown paths (`./a.png`, `<a b.png>`, `a%20b.png`, with
+	 * an optional `#anchor`).
+	 */
+	private resolveLinkpath(linkpath: string, notePath: string): TFile | null {
+		const raw = linkpath
+			.trim()
+			.replace(/^</, '')
+			.replace(/>$/, '')
+			.split('#')[0]
+			.trim();
+		if (!raw || /^[a-z]+:\/\//i.test(raw)) return null;
+		let decoded = raw;
+		try {
+			decoded = decodeURIComponent(raw);
+		} catch {
+			decoded = raw;
+		}
+		const found = this.app.metadataCache.getFirstLinkpathDest(decoded, notePath);
+		if (found) return found;
+		const direct = this.app.vault.getAbstractFileByPath(decoded.replace(/^\.\//, ''));
+		return direct instanceof TFile ? direct : null;
+	}
+
+	/** New markdown for a reference, keeping an author-supplied size or caption. */
+	private replacementFor(
+		kind: EmbedKind,
+		match: RegExpMatchArray,
+		url: string,
+		fit: Fit,
+	): string {
+		if (kind === 'wiki') return embedMarkdown(url, fit, match[2] ?? '');
+		return this.mdReplacement(match[1] ?? '', url, fit);
+	}
+
+	/** Markdown image -> hosted link; `![300](a.png)` carries a size where markdown expects a caption. */
+	private mdReplacement(alt: string, url: string, fit: Fit): string {
+		const caption = alt.trim();
+		if (/^\|?\d+(x\d+)?$/.test(caption)) {
+			return embedMarkdown(url, fit, caption.startsWith('|') ? caption : `|${caption}`);
+		}
+		return embedMarkdown(url, fit, '', caption);
+	}
+
+	/** Swap every reference to `file` in the active note; returns how many were swapped. */
+	private replaceReferencesInActiveNote(file: TFile, url: string, fit: Fit): number {
+		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!view?.editor) return 0;
+		const editor = view.editor;
+		const notePath = view.file?.path ?? '';
+		let swapped = 0;
+		for (let i = 0; i < editor.lineCount(); i += 1) {
+			const line = editor.getLine(i);
+			if (!line.includes('![')) continue;
+			EMBED_G.lastIndex = 0;
+			let next = line.replace(EMBED_G, (whole: string, lp: string, suffix?: string) => {
+				if (this.resolveLinkpath(lp, notePath)?.path !== file.path) return whole;
+				swapped += 1;
+				return embedMarkdown(url, fit, suffix ?? '');
+			});
+			MD_IMAGE.lastIndex = 0;
+			next = next.replace(MD_IMAGE, (whole: string, alt: string, dest: string) => {
+				if (this.resolveLinkpath(dest, notePath)?.path !== file.path) return whole;
+				swapped += 1;
+				return this.mdReplacement(alt, url, fit);
+			});
+			if (next !== line) editor.setLine(i, next);
+		}
+		return swapped;
 	}
 
 	private mimeOf(file: TFile): string {
@@ -359,12 +491,44 @@ export default class ImageUploadRcgui extends Plugin {
 
 	private begin(): void {
 		this.busy += 1;
-		this.renderStatus('上传中…');
+		this.startedAt = Date.now();
+		this.said60 = false;
+		this.said180 = false;
+		this.said360 = false;
+		this.stopTicker();
+		this.ticker = window.setInterval(() => this.paintBusy(), 1000);
+		this.paintBusy();
+	}
+
+	/** 「上传中… 12s」——让用户看见它还在动，而不是像卡死。 */
+	private paintBusy(): void {
+		const sec = Math.round((Date.now() - this.startedAt) / 1000);
+		this.renderStatus(sec > 0 ? `上传中… ${sec}s` : '上传中…');
+		if (sec >= 60 && !this.said60) {
+			this.said60 = true;
+			new Notice('图床服务还在处理（已 60 秒）：Telegram 那边偶尔会排队，继续等即可', 6000);
+		} else if (sec >= 180 && !this.said180) {
+			this.said180 = true;
+			new Notice('已经 3 分钟了：大图走这条线路确实慢（约 75 KB/s），还在传就继续等', 8000);
+		} else if (sec >= 360 && !this.said360) {
+			this.said360 = true;
+			new Notice('已经 6 分钟了：要么图很大，要么真卡住了。不想等就取消后重试小的', 9000);
+		}
+	}
+
+	private stopTicker(): void {
+		if (this.ticker !== null) {
+			window.clearInterval(this.ticker);
+			this.ticker = null;
+		}
 	}
 
 	private end(): void {
 		this.busy = Math.max(0, this.busy - 1);
-		if (this.busy === 0) this.renderStatus('就绪');
+		if (this.busy === 0) {
+			this.stopTicker();
+			this.renderStatus('就绪');
+		}
 	}
 
 	private renderStatus(text: string): void {
@@ -376,8 +540,9 @@ export default class ImageUploadRcgui extends Plugin {
 	private fail(e: unknown): void {
 		const msg = e instanceof UploadError || e instanceof Error ? e.message : String(e);
 		console.error('[image-upload-rcgui]', e);
-		new Notice(msg, 8000);
-		if (msg.includes('没找到 RCGUI') || msg.includes('超时')) this.renderStatus('未连接');
+		new Notice(msg, 10000);
+		// 只有「服务根本不在」才标红；超时说明服务在，只是慢，别把状态骗成未连接。
+		if (msg.includes('没找到 RCGUI')) this.renderStatus('未连接');
 	}
 }
 

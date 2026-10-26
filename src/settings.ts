@@ -74,7 +74,7 @@ export class RcguiSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('最大宽度')
-			.setDesc('超过就等比缩小后再传；0 表示不限制。')
+			.setDesc('笔记里显示的最大宽度（嵌入语法 `![|宽x高](url)`），超出按比例缩到框内；0 表示不限制。')
 			.addText((text) =>
 				text
 					.setPlaceholder('300')
@@ -87,7 +87,7 @@ export class RcguiSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('最大高度')
-			.setDesc('同上，默认 300。')
+			.setDesc('同上，两个值共同决定显示框；等比缩放，不会变形。')
 			.addText((text) =>
 				text
 					.setPlaceholder('300')
@@ -96,6 +96,15 @@ export class RcguiSettingTab extends PluginSettingTab {
 						const n = Number(v.trim());
 						this.draft.maxHeight = Number.isFinite(n) && n >= 0 ? Math.round(n) : 300;
 					}),
+			);
+
+		new Setting(containerEl)
+			.setName('上传前真的缩小图片')
+			.setDesc('默认关：原图照传，只在笔记里限制显示大小。打开后按上面的宽高重编码文件本身（会损失画质）。')
+			.addToggle((toggle) =>
+				toggle.setValue(this.draft.shrinkPixels).onChange((v) => {
+					this.draft.shrinkPixels = v;
+				}),
 			);
 
 		new Setting(containerEl)

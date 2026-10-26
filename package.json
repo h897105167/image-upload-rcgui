@@ -1,6 +1,6 @@
 {
   "name": "image-upload-rcgui",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Obsidian plugin that uploads images to the RCGUI imagehost plugin over HTTP.",
   "type": "module",
   "private": true,

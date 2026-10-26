@@ -1,7 +1,7 @@
 {
   "id": "image-upload-rcgui",
   "name": "Image Upload RCGUI",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "minAppVersion": "1.4.0",
   "description": "把笔记里的图片传到 RCGUI 图床插件（imagehost）的 HTTP 服务，粘贴即上传，返回直链或短链。",
   "author": "rcdeck",

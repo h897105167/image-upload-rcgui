@@ -3,7 +3,13 @@ import type { PingInfo, RcguiSettings, UploadResult } from './types';
 
 /** The host caps multipart field sizes, so the client always posts a raw byte body. */
 const PING_TIMEOUT = 2500;
-const UPLOAD_TIMEOUT = 120_000;
+/**
+ * Measured against a local RCGUI: 70 B answers in ~3 s, 1 MB in ~5–10 s, 5.9 MB in ~78 s
+ * (the RCGUI plugin pushes to the remote at roughly 75 KB/s), and three parallel uploads
+ * took 4.7 s / 3.5 s / 28 s. So a 2-minute cap aborted requests that were still moving —
+ * it cut off exactly the large screenshots people paste. Budget: 20 MB at 75 KB/s ≈ 270 s.
+ */
+const UPLOAD_TIMEOUT = 600_000;
 /** Images above this size are re-encoded once before upload to keep it fast. */
 const SOFT_LIMIT = 18 * 1024 * 1024;
 
@@ -92,17 +98,28 @@ export class RcguiClient {
 		const base = this.baseUrl();
 		const url = `${base}/plugin/imagehost/upload?name=${encodeURIComponent(filename)}`;
 		const body = await blob.arrayBuffer();
-		const res = await withTimeout(
-			requestUrl({
-				url,
-				method: 'POST',
-				body,
-				contentType: blob.type || 'application/octet-stream',
-				throw: false,
-			}),
-			UPLOAD_TIMEOUT,
-			'上传图片',
-		);
+		let res;
+		try {
+			res = await withTimeout(
+				requestUrl({
+					url,
+					method: 'POST',
+					body,
+					contentType: blob.type || 'application/octet-stream',
+					throw: false,
+				}),
+				UPLOAD_TIMEOUT,
+				'上传图片',
+			);
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			if (!msg.includes('超时')) throw e;
+			throw new UploadError(
+				`上传超时：等了 ${Math.round(UPLOAD_TIMEOUT / 1000)} 秒服务端还没回。` +
+					'图片很可能已经在往上走了 —— 过一会儿在 RCGUI 的图床里能看到；' +
+					'如果确实没上去，重新粘一次即可（同名文件若已被收录会直接返回链接，不会重复占空间）。',
+			);
+		}
 		let payload: UploadResult | { ok: false; error?: string } | null = null;
 		try {
 			payload = res.json as UploadResult;
@@ -165,42 +182,48 @@ function canvasToBlob(canvas: HTMLCanvasElement, mime: string, quality?: number)
 }
 
 /**
- * Shrink an image to fit the configured limits:
+ * Measure an image, and re-encode it only when `shrinkPixels` is on:
  * 1. scale down proportionally when it exceeds maxWidth/maxHeight;
  * 2. re-encode as JPEG when the result is still above SOFT_LIMIT.
- * Animated GIFs are left alone so the animation is not flattened.
+ * With `shrinkPixels` off (the default) the bytes go up untouched — the
+ * configured limits are used for the display size written into the note.
+ * Animated GIFs are never re-encoded, so the animation is not flattened.
  */
 export async function prepareImage(
 	blob: Blob,
 	filename: string,
 	maxWidth: number,
 	maxHeight: number,
+	shrinkPixels: boolean,
 ): Promise<PreparedImage> {
 	const mime = blob.type || 'image/png';
-	if (mime === 'image/gif' || mime === 'image/svg+xml') {
-		return { blob, filename, resized: false, width: 0, height: 0 };
-	}
+	const untouched: PreparedImage = { blob, filename, resized: false, width: 0, height: 0 };
+	if (mime === 'image/svg+xml') return untouched;
 
 	let img: HTMLImageElement;
 	try {
 		img = await loadImage(blob);
 	} catch {
 		// Undecodable: send it as-is and let the server judge.
-		return { blob, filename, resized: false, width: 0, height: 0 };
+		return untouched;
+	}
+	const natural = { width: img.naturalWidth, height: img.naturalHeight };
+	if (!shrinkPixels || mime === 'image/gif') {
+		return { ...untouched, width: natural.width, height: natural.height };
 	}
 
 	const limitW = Number(maxWidth) > 0 ? Number(maxWidth) : Infinity;
 	const limitH = Number(maxHeight) > 0 ? Number(maxHeight) : Infinity;
-	const scale = Math.min(1, limitW / img.naturalWidth, limitH / img.naturalHeight);
+	const scale = Math.min(1, limitW / natural.width, limitH / natural.height);
 	const needsResize = scale < 0.999;
 	const needsShrink = blob.size > SOFT_LIMIT;
 
 	if (!needsResize && !needsShrink) {
-		return { blob, filename, resized: false, width: img.naturalWidth, height: img.naturalHeight };
+		return { ...untouched, width: natural.width, height: natural.height };
 	}
 
-	const width = Math.max(1, Math.round(img.naturalWidth * scale));
-	const height = Math.max(1, Math.round(img.naturalHeight * scale));
+	const width = Math.max(1, Math.round(natural.width * scale));
+	const height = Math.max(1, Math.round(natural.height * scale));
 	const canvas = document.createElement('canvas');
 	canvas.width = width;
 	canvas.height = height;

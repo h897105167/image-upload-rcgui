@@ -4,10 +4,12 @@ export interface RcguiSettings {
 	port: number;
 	/** Optional full base URL; when set it wins over the port (remote host or custom hostname). */
 	serverUrl: string;
-	/** Max image width; larger images are scaled proportionally. 0 = unlimited. */
+	/** Max width for the image as drawn in the note (embed size). 0 = unlimited. */
 	maxWidth: number;
-	/** Max image height; 0 = unlimited. */
+	/** Max height for the image as drawn in the note (embed size). 0 = unlimited. */
 	maxHeight: number;
+	/** Also re-encode the file itself down to those limits (off by default: only the display size changes). */
+	shrinkPixels: boolean;
 	/** Upload pasted images automatically. */
 	autoUploadOnPaste: boolean;
 	/** Delete the vault's local copy once the upload succeeded. */
@@ -23,6 +25,7 @@ export const DEFAULT_SETTINGS: RcguiSettings = {
 	serverUrl: '',
 	maxWidth: 300,
 	maxHeight: 300,
+	shrinkPixels: false,
 	autoUploadOnPaste: true,
 	deleteLocalFile: true,
 	linkKind: 'direct',
