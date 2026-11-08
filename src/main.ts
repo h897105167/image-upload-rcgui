@@ -11,9 +11,10 @@ import {
 } from 'obsidian';
 import { embedMarkdown, Fit, fitForDisplay } from './embed';
 import { RcguiSettingTab } from './settings';
-import { DEFAULT_SETTINGS, RcguiSettings } from './types';
+import { DEFAULT_SETTINGS, PingInfo, RcguiSettings } from './types';
 import {
 	imagesFrom,
+	PING_TIMEOUT,
 	prepareImage,
 	RcguiClient,
 	stampName,
@@ -30,6 +31,9 @@ const EMBED_G = /!\[\[([^\]|]+)(\|[^\]]*)?\]\]/g;
 /** Which flavour of image reference a match came from. */
 type EmbedKind = 'wiki' | 'md';
 
+/** 焦点重探的最小间隔。切窗口很频繁，每次切回来都去打一个端口没必要。 */
+const FOCUS_PROBE_MS = 10_000;
+
 export default class ImageUploadRcgui extends Plugin {
 	settings: RcguiSettings = { ...DEFAULT_SETTINGS };
 	private statusEl: HTMLElement | null = null;
@@ -41,6 +45,10 @@ export default class ImageUploadRcgui extends Plugin {
 	private said360 = false;
 	/** Uploads run one at a time: the site queues them anyway, and 3 parallel requests made one take 28 s. */
 	private chain: Promise<unknown> = Promise.resolve();
+	/** 已经有探测在飞：退避重试、焦点重探、手动命令可能撞在一起，只放一个过去。 */
+	private probing = false;
+	/** 上一次探测开始的时刻（毫秒时间戳），焦点重探靠它节流。 */
+	private lastProbeAt = 0;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -78,7 +86,7 @@ export default class ImageUploadRcgui extends Plugin {
 							.setTitle('上传图片')
 							.setIcon('upload')
 							.onClick(() =>
-								void this.uploadEmbed(target.file, target.match, target.kind, editor, info),
+								void this.uploadEmbed(target.file, target.match, target.kind, editor, info.file),
 							),
 					);
 					return;
@@ -122,7 +130,7 @@ export default class ImageUploadRcgui extends Plugin {
 		this.addCommand({
 			id: 'detect-service',
 			name: '检测 RCGUI 服务',
-			callback: () => void this.detectService(true),
+			callback: () => void this.runProbe(false),
 		});
 
 		this.addCommand({
@@ -134,12 +142,15 @@ export default class ImageUploadRcgui extends Plugin {
 					new Notice('光标没落在一个图片内链上');
 					return;
 				}
-				await this.uploadEmbed(target.file, target.match, target.kind, editor, view);
+				await this.uploadEmbed(target.file, target.match, target.kind, editor, view.file);
 			},
 		});
 
-		// Light probe at startup, only for the status bar; never bothers the user.
-		void this.detectService(false);
+		// Obsidian 往往比 RCGUI 早几秒启动，那时端口还没人听。先探一次，再退避补几次；
+		// 全程只在状态条上说话，不弹 Notice。
+		void this.probeWithRetries();
+		// 切回窗口时补一次：RCGUI 可能是中途才打开、或者重启过的。
+		this.registerDomEvent(window, 'focus', () => void this.probeOnFocus());
 	}
 
 	onunload(): void {
@@ -194,12 +205,15 @@ export default class ImageUploadRcgui extends Plugin {
 		from: EditorPosition,
 	): Promise<void> {
 		const deadline = Date.now() + 6000;
+		// Pin the note now: after a tab switch `info.file` is the file the user moved to, and the
+		// reference we are tracking lives in the note we were pasting into.
+		const note = info.file;
 		let handled = 0;
 		while (Date.now() < deadline && handled < 8) {
-			const hit = this.embedNear(editor, info, from.line);
+			const hit = this.embedNear(editor, note, from.line);
 			if (hit && hit.file.stat.mtime >= Date.now() - 15000) {
 				handled += 1;
-				await this.uploadEmbed(hit.file, hit.match, hit.kind, editor, info, hit.line);
+				await this.uploadEmbed(hit.file, hit.match, hit.kind, editor, note, hit.line);
 				continue;
 			}
 			await sleep(hit ? 80 : 150);
@@ -209,10 +223,10 @@ export default class ImageUploadRcgui extends Plugin {
 	/** Image embed near the cursor (current or next line). */
 	private embedNear(
 		editor: Editor,
-		info: MarkdownView | MarkdownFileInfo,
+		note: TFile | null,
 		line: number,
 	): { file: TFile; match: RegExpMatchArray; kind: EmbedKind; line: number } | null {
-		const notePath = info.file?.path ?? '';
+		const notePath = note?.path ?? '';
 		for (const at of [line, line + 1]) {
 			if (at < 0 || at >= editor.lineCount()) continue;
 			const hit = this.matchRef(editor.getLine(at), notePath);
@@ -227,33 +241,81 @@ export default class ImageUploadRcgui extends Plugin {
 		match: RegExpMatchArray,
 		kind: EmbedKind,
 		editor: Editor,
-		info: MarkdownView | MarkdownFileInfo,
+		note: TFile | null,
 		line?: number,
 	): Promise<void> {
-		const notePath = info.file?.path ?? '';
+		const notePath = note?.path ?? '';
 		const target = this.resolveLinkpath(match[1], notePath) ?? file;
 		try {
 			const buf = await this.app.vault.readBinary(target);
 			const blob = new Blob([buf], { type: this.mimeOf(target) });
 			const sent = await this.send(blob, target.name);
 			const at = line ?? editor.getCursor().line;
+			// With replacement off the link is only reported, so nothing in the note depends on the
+			// local file and the delete is safe.
+			let swapped = !this.settings.replaceEmbeds;
 			if (this.settings.replaceEmbeds) {
-				const lineText = editor.getLine(at);
-				const next = lineText.replace(match[0], this.replacementFor(kind, match, sent.url, sent.fit));
-				if (next !== lineText) {
-					editor.setLine(at, next);
+				swapped = await this.replaceReference(
+					editor,
+					note,
+					at,
+					match[0],
+					this.replacementFor(kind, match, sent.url, sent.fit),
+				);
+				if (swapped) {
+					new Notice(`已上传并替换引用：${sent.url}`, 4000);
 				} else {
-					// Nothing was swapped: say why instead of silently leaving the old path behind.
-					new Notice(`已上传，但第 ${at + 1} 行没找到这段引用，链接已复制：${sent.url}`, 10000);
+					// The note still shows the old path: keep the local file and hand over the URL.
+					new Notice(`已上传，但没改到笔记里的引用（链接已复制）：${sent.url}`, 10000);
 					await navigator.clipboard.writeText(sent.url).catch(() => undefined);
 				}
 			} else {
 				new Notice(`已上传：${sent.url}`, 8000);
 			}
-			if (this.settings.deleteLocalFile) await this.trash(target);
+			if (this.settings.deleteLocalFile && swapped) await this.trash(target);
 		} catch (e) {
 			this.fail(e);
 		}
+	}
+
+	/**
+	 * Swap one reference inside the note, and report whether the note really changed.
+	 *
+	 * The editor captured when the paste happened may be gone by the time the upload finishes:
+	 * switching files destroys that view, and writes to a destroyed view go nowhere. So the editor
+	 * write is read back before it is trusted, and a stale editor falls back to rewriting the file
+	 * on disk. Returning false means the caller must not delete the local attachment.
+	 */
+	private async replaceReference(
+		editor: Editor,
+		note: TFile | null,
+		line: number,
+		needle: string,
+		replacement: string,
+	): Promise<boolean> {
+		try {
+			const before = editor.getLine(line);
+			const next = before.replace(needle, replacement);
+			if (next !== before) {
+				editor.setLine(line, next);
+				if (editor.getLine(line) === next) return true;
+			}
+		} catch {
+			// Out-of-range line or a destroyed view; the file path below handles both.
+		}
+		if (!note) return false;
+		let hit = false;
+		try {
+			await this.app.vault.process(note, (text) => {
+				const out = swapLine(text, line, needle, replacement);
+				if (out === null) return text;
+				hit = true;
+				return out;
+			});
+		} catch {
+			return false;
+		}
+		return hit;
 	}
 
 	private async uploadSelection(editor: Editor, info: MarkdownView | MarkdownFileInfo): Promise<void> {
@@ -264,7 +326,7 @@ export default class ImageUploadRcgui extends Plugin {
 			new Notice('没在选中内容里找到图片引用');
 			return;
 		}
-		await this.uploadEmbed(hit.file, hit.match, hit.kind, editor, info);
+		await this.uploadEmbed(hit.file, hit.match, hit.kind, editor, info.file);
 	}
 
 	private async uploadVaultFile(file: TFile): Promise<void> {
@@ -475,18 +537,80 @@ export default class ImageUploadRcgui extends Plugin {
 		}
 	}
 
-	private async detectService(verbose: boolean): Promise<void> {
-		this.renderStatus('检测中…');
+	/**
+	 * 探测一次 RCGUI 的 HTTP 服务并更新状态条，返回这次是否探到了。
+	 *
+	 * quiet=false 是用户主动触发（命令面板）：会先写「检测中…」，结果用 Notice 讲清楚。
+	 * quiet=true 是后台补探：只改状态条，绝不弹窗。
+	 */
+	private async runProbe(quiet: boolean): Promise<boolean> {
+		if (this.probing) return false;
+		// 上传正在跑时状态条是进度条，别被"未连接"盖掉。
+		if (quiet && this.busy > 0) return false;
+		this.probing = true;
+		this.lastProbeAt = Date.now();
+		if (!quiet) this.renderStatus('检测中…');
 		try {
-			const { info } = await this.client().detect();
-			this.renderStatus('就绪');
-			if (verbose) {
-				new Notice(`RCGUI 图床就绪：端口 ${info.port}，上限 ${info.max_mb}MB`, 5000);
+			const state = await this.probeOnce();
+			if (state.ok) {
+				this.renderStatus('就绪');
+				if (!quiet) {
+					new Notice(`RCGUI 图床就绪：端口 ${state.info.port}，上限 ${state.info.max_mb}MB`, 5000);
+				}
+				return true;
 			}
-		} catch (e) {
-			this.renderStatus('未连接');
-			if (verbose) this.fail(e);
+			this.renderStatus(`未连接：${state.reason}`);
+			if (!quiet) {
+				new Notice(`连不上 RCGUI：${state.reason}。先确认 RCGUI 正开着，并且在里面启用了 HTTP 服务。`, 10000);
+			}
+			return false;
+		} finally {
+			this.probing = false;
 		}
+	}
+
+	/**
+	 * 一次完整的探测，不碰状态条。
+	 *
+	 * detect() 会把 5270..5285 逐个试一遍，它抛出的错误是「最后一个端口」的，
+	 * 而 5285 通常只是没人听 —— 拿它当原因会把人带到错的方向。所以扫描失败后
+	 * 再单独问一次配置里的那个端口：它的错误才是用户真正需要看到的。
+	 */
+	private async probeOnce(): Promise<{ ok: true; info: PingInfo } | { ok: false; reason: string }> {
+		const client = this.client();
+		try {
+			const { info } = await client.detect();
+			return { ok: true, info };
+		} catch {
+			try {
+				const info = await client.ping();
+				// 扫描的那几秒里服务刚好起来了，按成功处理。
+				return { ok: true, info };
+			} catch (direct) {
+				return { ok: false, reason: describeProbeFailure(direct) };
+			}
+		}
+	}
+
+	/**
+	 * 启动时的补探：1s / 2s / 4s / 8s 退避，最多再试 4 次（加起来约 15 秒）。
+	 * 探到就停；插件被卸载（statusEl 已置空）也停。全失败就停在「未连接：原因」。
+	 */
+	private async probeWithRetries(): Promise<void> {
+		const delays = [1000, 2000, 4000, 8000];
+		for (const delay of delays) {
+			if (await this.runProbe(true)) return;
+			await sleep(delay);
+			if (!this.statusEl) return;
+		}
+		await this.runProbe(true);
+	}
+
+	/** 窗口重新获得焦点时补探一次；上传中、或距上次探测不到 10 秒都跳过。 */
+	private async probeOnFocus(): Promise<void> {
+		if (!this.statusEl || this.busy > 0) return;
+		if (Date.now() - this.lastProbeAt < FOCUS_PROBE_MS) return;
+		await this.runProbe(true);
 	}
 
 	private begin(): void {
@@ -533,7 +657,8 @@ export default class ImageUploadRcgui extends Plugin {
 
 	private renderStatus(text: string): void {
 		if (!this.statusEl) return;
-		const dot = text === '就绪' ? '●' : text === '未连接' ? '○' : '◌';
+		// 带原因的失败文案形如「未连接：…」，所以只能看前缀；全等比较会让它掉成 ◌。
+		const dot = text.startsWith('就绪') ? '●' : text.startsWith('未连接') ? '○' : '◌';
 		this.statusEl.setText(`${dot} RCGUI 图床：${text}`);
 	}
 
@@ -542,7 +667,7 @@ export default class ImageUploadRcgui extends Plugin {
 		console.error('[image-upload-rcgui]', e);
 		new Notice(msg, 10000);
 		// 只有「服务根本不在」才标红；超时说明服务在，只是慢，别把状态骗成未连接。
-		if (msg.includes('没找到 RCGUI')) this.renderStatus('未连接');
+		if (msg.includes('没找到 RCGUI')) this.renderStatus(`未连接：${describeProbeFailure(e)}`);
 	}
 }
 
@@ -555,4 +680,37 @@ function fmtSize(bytes: number): string {
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+/**
+ * 在 `line`（0 起算）那行把 `needle` 换成 `replacement`，返回整篇新文本。
+ *
+ * 先试原行，原行找不到再全篇找第一次出现的位置——上传期间用户可能在别的行动过字，
+ * 行号会偏。找不到时返回 null，调用方据此区分「没命中」和「命中了但内容没变」。
+ */
+function swapLine(text: string, line: number, needle: string, replacement: string): string | null {
+	const lines = text.split('\n');
+	if (line >= 0 && line < lines.length && lines[line].includes(needle)) {
+		lines[line] = lines[line].replace(needle, replacement);
+		return lines.join('\n');
+	}
+	for (let i = 0; i < lines.length; i += 1) {
+		if (i === line || !lines[i].includes(needle)) continue;
+		lines[i] = lines[i].replace(needle, replacement);
+		return lines.join('\n');
+	}
+	return null;
+}
+
+/**
+ * 把探测失败翻译成一句能照着修的话。
+ *
+ * detect() 抛出的是整串错误的拼接（每个端口一条），直接显示只会让人更糊涂，
+ * 所以按关键字归成三类。认不出来的一律当成「服务没起来」——那也是最常见的一种。
+ */
+function describeProbeFailure(e: unknown): string {
+	const msg = e instanceof Error ? e.message : String(e);
+	if (msg.includes('超时')) return `探测超时（${PING_TIMEOUT}ms）`;
+	if (msg.includes('不是 imagehost')) return '端口被别的程序占用（不是 imagehost）';
+	return 'RCGUI 未启动或 HTTP 服务已关闭';
 }

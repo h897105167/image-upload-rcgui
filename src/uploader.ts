@@ -1,8 +1,8 @@
 import { requestUrl } from 'obsidian';
 import type { PingInfo, RcguiSettings, UploadResult } from './types';
 
-/** The host caps multipart field sizes, so the client always posts a raw byte body. */
-const PING_TIMEOUT = 2500;
+/** 单端口探测的预算（毫秒）。本地服务回一个几十字节的 JSON 通常 <300 ms，等满这么久还没动静就是没人听。 */
+export const PING_TIMEOUT = 2500;
 /**
  * Measured against a local RCGUI: 70 B answers in ~3 s, 1 MB in ~5–10 s, 5.9 MB in ~78 s
  * (the RCGUI plugin pushes to the remote at roughly 75 KB/s), and three parallel uploads
